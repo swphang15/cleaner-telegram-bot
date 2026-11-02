@@ -1,4 +1,3 @@
-import utils.session
 import os
 import re
 import csv
