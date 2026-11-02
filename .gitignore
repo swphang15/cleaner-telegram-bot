@@ -7,3 +7,4 @@ images/
 *.csv
 __pycache__/
 .vscode/
+data/

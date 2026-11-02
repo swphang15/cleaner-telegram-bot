@@ -1,0 +1,5 @@
+# Only these source files are needed to build the image.
+**
+!Dockerfile
+!requirements.txt
+!bot.py

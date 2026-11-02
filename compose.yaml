@@ -1,0 +1,39 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: Asia/Kuala_Lumpur
+      BOT_DATA_DIR: /data
+      BOT_TOKEN_FILE: /run/secrets/telegram_token
+    volumes:
+      - type: bind
+        source: ./bot.py
+        target: /app/bot.py
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./token.txt
+        target: /run/secrets/telegram_token
+        read_only: true
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

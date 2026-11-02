@@ -30,9 +30,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Set up absolute paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DOWNLOAD_DIR = os.path.join(BASE_DIR, "images")
-DB_PATH = os.path.join(BASE_DIR, "reports.db")
-TOKEN_PATH = os.path.join(BASE_DIR, "token.txt")
+DATA_DIR = os.path.abspath(os.environ.get("BOT_DATA_DIR", BASE_DIR))
+DOWNLOAD_DIR = os.path.join(DATA_DIR, "images")
+DB_PATH = os.path.join(DATA_DIR, "reports.db")
+TOKEN_PATH = os.environ.get("BOT_TOKEN_FILE", os.path.join(BASE_DIR, "token.txt"))
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -87,6 +88,13 @@ def init_db():
         cursor.execute("ALTER TABLE task_reports ADD COLUMN pair_image_path TEXT DEFAULT NULL")
     if "pair_status" not in columns:
         cursor.execute("ALTER TABLE task_reports ADD COLUMN pair_status TEXT DEFAULT 'COMPLETED'")
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reports_date ON task_reports(date_logged)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_reports_user_date ON task_reports(user_id, date_logged)")
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_reports_pending_pair
+        ON task_reports(user_id, block_name, task_type, pair_status, id)
+    ''')
 
     conn.commit()
     conn.close()
@@ -699,7 +707,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_filename = f"reports_backup_{timestamp_str}.db"
-    backup_temp_path = os.path.join(BASE_DIR, backup_filename)
+    backup_temp_path = os.path.join(DATA_DIR, backup_filename)
 
     status_msg = await update.message.reply_text("📦 Generating database snapshot...")
 
@@ -831,7 +839,7 @@ async def report_monthly_command(update: Update, context: ContextTypes.DEFAULT_T
     status_msg = await update.message.reply_text(f"Compiling Word report for {filter_desc}...")
 
     block_suffix = f"_{target_block.replace(' ', '_')}" if target_block else ""
-    output_docx = os.path.join(BASE_DIR, f"Monthly_Report_{target_ym}{block_suffix}.docx")
+    output_docx = os.path.join(DATA_DIR, f"Monthly_Report_{target_ym}{block_suffix}.docx")
     generated_path = generate_monthly_docx(output_docx, target_ym, target_block)
 
     if not generated_path or not os.path.exists(generated_path):
@@ -859,7 +867,7 @@ async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     status_msg = await update.message.reply_text(f"Exporting CSV records for {filter_desc}...")
 
     block_suffix = f"_{target_block.replace(' ', '_')}" if target_block else ""
-    output_csv = os.path.join(BASE_DIR, f"Task_Log_{target_ym}{block_suffix}.csv")
+    output_csv = os.path.join(DATA_DIR, f"Task_Log_{target_ym}{block_suffix}.csv")
     generated_path = generate_monthly_csv(output_csv, target_ym, target_block)
 
     if not generated_path or not os.path.exists(generated_path):
