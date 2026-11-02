@@ -5,17 +5,8 @@
 1. 安装并启动 Docker（Windows 使用 Docker Desktop 的 Linux containers）。
 2. 在项目根目录创建 `token.txt`，只填写从 @BotFather 获取的新 Bot Token。不要提交凭据。
 3. 检查 `bot.py` 中 `ADMIN_IDS` 是否为你自己的 Telegram 用户 ID。
-4. Windows 无需手动创建 `data`，Docker Compose 会自动创建并挂载。
-   Linux 首次部署使用以下命令准备容器用户的访问权限：
-
-   ```sh
-   mkdir -p data
-   sudo chown -R 10001:10001 data
-   sudo chown 10001:10001 token.txt
-   sudo chmod 600 token.txt
-   ```
-
-5. 在项目目录运行：
+4. Windows 和 Linux 都无需手动创建 `data` 或执行 `chown`。
+   在项目目录运行：
 
    ```sh
    docker compose up -d --build
@@ -24,6 +15,12 @@
 
 机器人使用 Telegram polling，不需要开放端口。不要同时运行多个使用同一 Token 的实例。
 镜像以 UID/GID `10001:10001` 运行，根文件系统只读，只有数据目录和临时目录可写。
+Compose 会先运行一次 `init-storage`：创建照片目录、修复整个数据目录的所有者和写入权限，
+并在保留 Token 文件所有者的同时将其组设置为 `10001`、允许组读取并移除其他用户权限。
+初始化服务临时以 root 运行，只挂载数据和 Token，不连接网络，成功后退出；
+机器人等它成功后才以非 root 用户启动，Token 对机器人仍为只读。
+日志中 `init-storage` 显示 `Exited (0)` 是正常状态。
+宿主机需要允许 bind mount 的 `chown`/`chmod`；只读磁盘或禁止修改所有者的网络文件系统不适用。
 
 ## 拉取代码更新
 
@@ -70,7 +67,7 @@ Compose 将宿主机 `./data` 直接绑定到容器 `/data`：
 ## 已有数据迁移
 
 首次切换到 Docker 前停止旧机器人，把原目录的 `reports.db`、`images/` 和需要保留的
-Word/CSV 报告复制到 `data/`，保留原始备份，并设置上述目录权限。
+Word/CSV 报告复制到 `data/`，保留原始备份。初始化服务会自动设置目录权限。
 旧数据库中的照片路径可能是 Windows 或其他机器的绝对路径，复制后不会自动转换。
 这些旧记录需要将 `image_path` 和 `pair_image_path` 转换成对应的 `/data/images/...` 路径，
 否则旧照片无法用于报告。新容器记录使用 `/data/images/...`，重建后路径保持一致。
