@@ -52,13 +52,6 @@ with open(TOKEN_PATH, "r", encoding="utf-8") as f:
 if not TOKEN:
     raise ValueError(f"'token.txt' at {TOKEN_PATH} is empty. Please add your Telegram Bot Token.")
 
-# --- SECURITY CONFIGURATION ---
-ADMIN_IDS = [
-    1807919625,
-]
-
-ALLOWED_WORKER_IDS = []
-
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -295,27 +288,15 @@ def generate_monthly_csv(output_csv_path, year_month_filter, target_block=None):
 
 
 async def check_admin_rights(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    if user_id in ADMIN_IDS:
-        return True
-
-    chat = update.effective_chat
-    if chat and chat.type in ["group", "supergroup"]:
-        chat_member = await context.bot.get_chat_member(chat.id, user_id)
-        if chat_member.status in ["administrator", "creator"]:
-            return True
-
-    return False
+    """Allows all users to access report and management features."""
+    return True
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    is_admin = await check_admin_rights(update, context)
-
     menu_text = (
         "🧹 **FACILITY CLEANING REPORT BOT**\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Welcome! Use this bot to submit daily cleaning logs, track your progress, and compile client reports.\n\n"
+        "Welcome! Use this bot to submit daily cleaning logs, track progress, and generate client reports.\n\n"
 
         "📸 **HOW TO SUBMIT A TASK**\n"
         "1. Attach a photo (or uncompressed image file).\n"
@@ -323,33 +304,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   • Example: `#blockA Restroom 2 sanitized`\n"
         "   • *(If you forget `#block`, tap the inline button that appears!)*\n\n"
 
-        "🔄 **BEFORE & AFTER PHOTO PAIRING (Optional but recommended)**\n"
+        "🔄 **BEFORE & AFTER PHOTO PAIRING (Optional)**\n"
         "• **Step 1 (Dirty):** Send photo with `#before #blockA Restroom 2 sink`\n"
-        "• **Step 2 (Clean):** Send photo with `#after #blockA Restroom 2 sink`\n"
-        "*(These will automatically pair side-by-side in the final Word report!)*\n\n"
+        "• **Step 2 (Clean):** Send photo with `#after #blockA Restroom 2 sink`\n\n"
 
-        "👷‍♂️ **WORKER COMMANDS**\n"
-        "• `/mystats` — View your monthly task target, progress bar & counts\n"
-        "• `/dailyreport` — Check today's shift activity breakdown\n"
-        "• `/dailyreport YYYY-MM-DD` — View summary for a past date\n"
+        "📋 **GENERAL COMMANDS**\n"
+        "• `/mystats` — View monthly task targets and progress bar\n"
+        "• `/dailyreport` — Check today's shift activity summary\n"
+        "• `/dailyreport YYYY-MM-DD` — View summary for a specific date\n"
         "• `/undo` — Delete your own most recent task submission\n"
-        "• `/myid` — View your numeric Telegram user ID\n"
-    )
+        "• `/undo <task_id>` — Delete a specific task by its ID\n"
+        "• `/myid` — View your numeric Telegram user ID\n\n"
 
-    if is_admin:
-        menu_text += (
-            "\n👑 **ADMINISTRATOR CONTROLS**\n"
-            "• `/reportmonthly [MM-YYYY] [block]` — Generate Word (.docx) report\n"
-            "   └ *Example:* `/reportmonthly 10-2026 blockA`\n"
-            "• `/exportcsv [MM-YYYY] [block]` — Export data spreadsheet (.csv)\n"
-            "• `/backup` — Download instant SQLite (`reports.db`) snapshot\n"
-            "• `/undo <task_id>` — Delete any worker's specific task by ID\n"
-            "• `/cleardata MM-YYYY` — Purge images and database logs for month\n"
-        )
-    else:
-        menu_text += (
-            "\n💡 *Admins have access to monthly Word exports, CSV data, and server backups.*"
-        )
+        "📊 **REPORTS & EXPORTS**\n"
+        "• `/reportmonthly [MM-YYYY] [block]` — Generate Word (.docx) report\n"
+        "   └ *Example:* `/reportmonthly 10-2026 blockA`\n"
+        "• `/exportcsv [MM-YYYY] [block]` — Export data spreadsheet (.csv)\n"
+        "• `/backup` — Download instant SQLite (`reports.db`) snapshot\n"
+        "• `/cleardata MM-YYYY` — Purge images and database logs for month\n"
+    )
 
     await update.message.reply_text(menu_text, parse_mode="Markdown")
 
@@ -365,9 +338,6 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
 
     user_id = update.effective_user.id
     user_name = update.effective_user.first_name or f"User_{user_id}"
-
-    if ALLOWED_WORKER_IDS and user_id not in ALLOWED_WORKER_IDS and user_id not in ADMIN_IDS:
-        return
 
     is_photo = bool(update.message.photo)
     is_document = bool(update.message.document)
@@ -546,16 +516,8 @@ async def block_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     task_id = int(data_parts[1])
-    original_user_id = int(data_parts[2])
     selected_block_letter = data_parts[3].upper()
     selected_block = f"BLOCK {selected_block_letter}"
-
-    calling_user_id = query.from_user.id
-    is_admin = await check_admin_rights(update, context)
-
-    if calling_user_id != original_user_id and not is_admin:
-        await query.answer(text="⚠️ Only the task submitter or an admin can set this block.", show_alert=True)
-        return
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -641,12 +603,10 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_id = update.effective_user.id
-    is_admin = await check_admin_rights(update, context)
-
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    if context.args and is_admin:
+    if context.args:
         target_arg = context.args[0].replace("#", "").strip()
         if not target_arg.isdigit():
             await update.message.reply_text("Usage: `/undo` or `/undo <task_id>`.")
@@ -697,10 +657,6 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin_rights(update, context):
-        await update.message.reply_text("Access denied: Only admins can export database backups.")
-        return
-
     if not os.path.exists(DB_PATH):
         await update.message.reply_text("⚠️ Database file `reports.db` does not exist yet.")
         return
@@ -830,10 +786,6 @@ def parse_month_and_block_args(args):
 
 
 async def report_monthly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin_rights(update, context):
-        await update.message.reply_text("Access denied: Only designated admins can generate reports.")
-        return
-
     target_ym, target_block = parse_month_and_block_args(context.args)
     filter_desc = f"`{target_ym}`" + (f" (Filtered: `{target_block}`)" if target_block else "")
     status_msg = await update.message.reply_text(f"Compiling Word report for {filter_desc}...")
@@ -858,10 +810,6 @@ async def report_monthly_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin_rights(update, context):
-        await update.message.reply_text("Access denied: Only designated admins can export CSV data.")
-        return
-
     target_ym, target_block = parse_month_and_block_args(context.args)
     filter_desc = f"`{target_ym}`" + (f" (Filtered: `{target_block}`)" if target_block else "")
     status_msg = await update.message.reply_text(f"Exporting CSV records for {filter_desc}...")
@@ -886,10 +834,6 @@ async def export_csv_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def clear_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_admin_rights(update, context):
-        await update.message.reply_text("Access denied: Only designated admins can purge storage data.")
-        return
-
     if not context.args:
         await update.message.reply_text("Usage: `/cleardata MM-YYYY`\nExample: `/cleardata 10-2026`")
         return
@@ -944,7 +888,6 @@ async def handle_unrecognized_text(update: Update, context: ContextTypes.DEFAULT
     chat_type = update.effective_chat.type
     user_text = update.effective_message.text or ""
 
-    # In group chats, only alert if they attempted an unknown command (starts with '/')
     if chat_type in ["group", "supergroup"] and not user_text.startswith("/"):
         return
 
@@ -987,7 +930,6 @@ async def shift_reminder_worker(app):
                 except Exception as e:
                     print(f"Failed to send reminder to {chat_id}: {e}")
 
-            # Sleep 65s so it won't fire again within the same minute
             await asyncio.sleep(65)
 
         await asyncio.sleep(30)
@@ -1022,7 +964,6 @@ if __name__ == '__main__':
     )
     app.add_handler(MessageHandler(media_filter, handle_photo_or_document))
 
-    # Fallback handlers for unrecognized commands and plain text (must be LAST)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unrecognized_text))
     app.add_handler(MessageHandler(filters.COMMAND, handle_unrecognized_text))
 
