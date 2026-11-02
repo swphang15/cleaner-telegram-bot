@@ -1,2 +1,9 @@
-config.bat
-node_modules
+token.txt
+reports.db
+reports_backup_*.db
+images/
+*.docx
+*.pdf
+*.csv
+__pycache__/
+.vscode/
