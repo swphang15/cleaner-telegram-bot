@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import csv
@@ -6,7 +7,10 @@ import sqlite3
 import logging
 import asyncio
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ExifTags
+import easyocr
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -20,6 +24,9 @@ from docx import Document
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from telegram.request import HTTPXRequest
+
+from utils.gdrive import upload_image_to_drive, download_image_as_stream, delete_drive_file
 
 # Logging configuration
 logging.basicConfig(
@@ -41,6 +48,19 @@ AVAILABLE_BLOCKS = ["A", "B", "C", "D"]
 
 # Configurable monthly quota target per worker
 MONTHLY_TASK_TARGET = 50
+
+# Global EasyOCR reader instance
+OCR_READER = None
+
+
+def get_ocr_reader():
+    """Initializes the EasyOCR reader lazily to avoid delay at script load."""
+    global OCR_READER
+    if OCR_READER is None:
+        # gpu=False ensures stability across CPU-based Windows instances
+        OCR_READER = easyocr.Reader(['en'], gpu=False)
+    return OCR_READER
+
 
 # --- LOAD SECURE TOKEN ---
 if not os.path.exists(TOKEN_PATH):
@@ -93,6 +113,135 @@ def init_db():
     conn.close()
 
 
+def extract_image_capture_date(file_path):
+    """
+    Attempts to read EXIF 'DateTimeOriginal' or 'DateTime' from an image.
+    Returns string 'YYYY-MM-DD HH:MM:SS' if found, else None.
+    """
+    try:
+        with Image.open(file_path) as img:
+            exif = img.getexif()
+            if not exif:
+                return None
+
+            exif_table = {
+                ExifTags.TAGS.get(k, k): v 
+                for k, v in exif.items()
+            }
+
+            raw_date = exif_table.get('DateTimeOriginal') or exif_table.get('DateTime')
+
+            if not raw_date:
+                try:
+                    exif_ifd = exif.get_ifd(0x8769)
+                    if exif_ifd:
+                        ifd_table = {
+                            ExifTags.TAGS.get(k, k): v 
+                            for k, v in exif_ifd.items()
+                        }
+                        raw_date = ifd_table.get('DateTimeOriginal') or ifd_table.get('DateTime')
+                except Exception:
+                    pass
+
+            if raw_date and isinstance(raw_date, str):
+                parts = raw_date.strip().split(" ")
+                date_part = parts[0].replace(":", "-")
+                time_part = parts[1] if len(parts) > 1 else "12:00:00"
+                if re.match(r"^\d{4}-\d{2}-\d{2}$", date_part):
+                    return f"{date_part} {time_part}"
+    except Exception as e:
+        logging.debug(f"Could not read EXIF data for {file_path}: {e}")
+
+    return None
+
+
+def extract_visual_timestamp_ocr(file_path):
+    """
+    Scans the image using EasyOCR to detect printed date watermarks.
+    Parses timestamps like '29 Oct 2026 at 5.31.48 PM' as well as standard formats.
+    """
+    month_map = {
+        'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'may': '05', 'jun': '06',
+        'jul': '07', 'aug': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
+    }
+
+    try:
+        reader = get_ocr_reader()
+        with Image.open(file_path) as img:
+            w, h = img.size
+            # Check bottom 35%, top 25%, then entire image
+            bottom_strip = img.crop((0, int(h * 0.65), w, h))
+            top_strip = img.crop((0, 0, w, int(h * 0.25)))
+            full_img = img.copy()
+
+            targets = [bottom_strip, top_strip, full_img]
+
+        for target_img in targets:
+            buf = io.BytesIO()
+            target_img.save(buf, format="JPEG", quality=90)
+            buf.seek(0)
+            
+            ocr_results = reader.readtext(buf.read(), detail=0)
+            if not ocr_results:
+                continue
+
+            raw_text = " ".join(ocr_results)
+            # Normalize common OCR noise: replace letters 'o'/'O' where digits are expected
+            normalized_text = re.sub(r'(?<=\d)[oO]|(?<=[/\.-])[oO]|[oO](?=\d)', '0', raw_text)
+
+            # --- Pattern 1: GPS Map / Timestamp Camera format (e.g., '29 Oct 2026 at 5.31.48 PM') ---
+            match_camera_stamp = re.search(
+                r'\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(20\d{2})(?:\s+at\s+(\d{1,2})[\.:](\d{2})(?:[\.:](\d{2}))?\s*(AM|PM)?)?',
+                normalized_text,
+                re.IGNORECASE
+            )
+            if match_camera_stamp:
+                d, mon_str, y, hr, mn, sc, meridiem = match_camera_stamp.groups()
+                mon_key = mon_str[:3].lower()
+                if mon_key in month_map:
+                    month_num = month_map[mon_key]
+                    
+                    # Convert 12-hour AM/PM to 24-hour SQL time
+                    if hr and mn:
+                        h_val = int(hr)
+                        m_val = int(mn)
+                        s_val = int(sc) if sc else 0
+                        if meridiem:
+                            meridiem = meridiem.upper()
+                            if meridiem == 'PM' and h_val < 12:
+                                h_val += 12
+                            elif meridiem == 'AM' and h_val == 12:
+                                h_val = 0
+                        time_str = f"{h_val:02d}:{m_val:02d}:{s_val:02d}"
+                    else:
+                        time_str = "12:00:00"
+                        
+                    return f"{y}-{month_num}-{int(d):02d} {time_str}"
+
+            # --- Pattern 2: Numeric YYYY-MM-DD or YYYY/MM/DD ---
+            match_ymd = re.search(r'\b(20\d{2})[/\.-](\d{1,2})[/\.-](\d{1,2})\b', normalized_text)
+            if match_ymd:
+                y, m, d = match_ymd.groups()
+                if 1 <= int(m) <= 12 and 1 <= int(d) <= 31:
+                    time_match = re.search(r'\b(\d{1,2})[\.:](\d{2})(?:[\.:](\d{2}))?\b', normalized_text)
+                    t_str = f"{time_match.group(1).zfill(2)}:{time_match.group(2)}:{time_match.group(3) or '00'}" if time_match else "12:00:00"
+                    return f"{y}-{int(m):02d}-{int(d):02d} {t_str}"
+
+            # --- Pattern 3: Numeric DD/MM/YYYY or DD-MM-YYYY ---
+            match_dmy = re.search(r'\b(\d{1,2})[/\.-](\d{1,2})[/\.-](20\d{2})\b', normalized_text)
+            if match_dmy:
+                d, m, y = match_dmy.groups()
+                if 1 <= int(m) <= 12 and 1 <= int(d) <= 31:
+                    time_match = re.search(r'\b(\d{1,2})[\.:](\d{2})(?:[\.:](\d{2}))?\b', normalized_text)
+                    t_str = f"{time_match.group(1).zfill(2)}:{time_match.group(2)}:{time_match.group(3) or '00'}" if time_match else "12:00:00"
+                    return f"{y}-{int(m):02d}-{int(d):02d} {t_str}"
+
+    except Exception as e:
+        logging.warning(f"OCR extraction failed on {file_path}: {e}")
+
+    return None
+
+
 def compress_image(file_path, max_dim=1280, quality=80):
     try:
         with Image.open(file_path) as img:
@@ -101,6 +250,36 @@ def compress_image(file_path, max_dim=1280, quality=80):
             img.save(file_path, "JPEG", optimize=True, quality=quality)
     except Exception as e:
         print(f"Image compression failed for {file_path}: {e}")
+
+
+def insert_image_into_paragraph(paragraph, img_reference, width, height, missing_text="[Image Missing]"):
+    """
+    Inserts an image into a python-docx paragraph.
+    Handles in-memory streams from Google Drive, existing local files, or missing fallbacks.
+    """
+    if not img_reference:
+        paragraph.add_run(missing_text)
+        return
+
+    stream = download_image_as_stream(img_reference)
+    if stream:
+        try:
+            paragraph.add_run().add_picture(stream, width=width, height=height)
+            return
+        except Exception as e:
+            print(f"Failed to add image stream {img_reference}: {e}")
+            paragraph.add_run("[Corrupted Image]")
+            return
+
+    if os.path.exists(img_reference):
+        try:
+            paragraph.add_run().add_picture(img_reference, width=width, height=height)
+            return
+        except Exception:
+            paragraph.add_run("[Corrupted Image]")
+            return
+
+    paragraph.add_run(missing_text)
 
 
 def generate_monthly_docx(output_docx_path, year_month_filter, target_block=None):
@@ -130,14 +309,14 @@ def generate_monthly_docx(output_docx_path, year_month_filter, target_block=None
         return None
 
     grouped = {}
-    for img_path, desc, dt, block, t_type, pair_img, p_status in records:
+    for img_ref, desc, dt, block, t_type, pair_img_ref, p_status in records:
         day_str = dt.split(" ")[0]
         item = {
-            "img": img_path,
+            "img": img_ref,
             "desc": desc,
             "dt": dt,
             "type": t_type,
-            "pair_img": pair_img,
+            "pair_img": pair_img_ref,
             "status": p_status
         }
         grouped.setdefault(day_str, {}).setdefault(block, []).append(item)
@@ -183,24 +362,18 @@ def generate_monthly_docx(output_docx_path, year_month_filter, target_block=None
                 c_before = comp_table.cell(1, 0)
                 p_b = c_before.paragraphs[0]
                 p_b.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                if os.path.exists(p_task["img"]):
-                    try:
-                        p_b.add_run().add_picture(p_task["img"], width=Inches(3.2), height=Inches(2.4))
-                    except Exception:
-                        p_b.add_run("[Corrupted Image]")
-                else:
-                    p_b.add_run("[Image Missing]")
+                insert_image_into_paragraph(p_b, p_task["img"], width=Inches(3.2), height=Inches(2.4))
 
                 c_after = comp_table.cell(1, 1)
                 p_a = c_after.paragraphs[0]
                 p_a.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                if p_task["pair_img"] and os.path.exists(p_task["pair_img"]):
-                    try:
-                        p_a.add_run().add_picture(p_task["pair_img"], width=Inches(3.2), height=Inches(2.4))
-                    except Exception:
-                        p_a.add_run("[Corrupted Image]")
-                else:
-                    p_a.add_run("[Pending After Photo]")
+                insert_image_into_paragraph(
+                    p_a,
+                    p_task["pair_img"],
+                    width=Inches(3.2),
+                    height=Inches(2.4),
+                    missing_text="[Pending After Photo]"
+                )
 
                 caption_p = doc.add_paragraph()
                 caption_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -221,13 +394,7 @@ def generate_monthly_docx(output_docx_path, year_month_filter, target_block=None
                     cell_p = cell.paragraphs[0]
                     cell_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-                    if os.path.exists(s_task["img"]):
-                        try:
-                            cell_p.add_run().add_picture(s_task["img"], width=Inches(1.75), height=Inches(1.75))
-                        except Exception:
-                            cell_p.add_text("[Corrupted Image]")
-                    else:
-                        cell_p.add_text("[Image Missing]")
+                    insert_image_into_paragraph(cell_p, s_task["img"], width=Inches(1.75), height=Inches(1.75))
 
                     desc_p = cell.add_paragraph()
                     desc_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -299,10 +466,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Welcome! Use this bot to submit daily cleaning logs, track progress, and generate client reports.\n\n"
 
         "📸 **HOW TO SUBMIT A TASK**\n"
-        "1. Attach a photo (or uncompressed image file).\n"
+        "1. Attach a photo (or uncompressed file).\n"
         "2. Add your description and `#block` tag in the caption.\n"
         "   • Example: `#blockA Restroom 2 sanitized`\n"
-        "   • *(If you forget `#block`, tap the inline button that appears!)*\n\n"
+        "   • *(If you forget `#block`, tap the inline button that appears!)*\n"
+        "   • *Date Note: The bot reads photo EXIF metadata, scans visual timestamp watermarks (OCR), or accepts `YYYY-MM-DD` in the caption.*\n\n"
 
         "🔄 **BEFORE & AFTER PHOTO PAIRING (Optional)**\n"
         "• **Step 1 (Dirty):** Send photo with `#before #blockA Restroom 2 sink`\n"
@@ -321,7 +489,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "   └ *Example:* `/reportmonthly 10-2026 blockA`\n"
         "• `/exportcsv [MM-YYYY] [block]` — Export data spreadsheet (.csv)\n"
         "• `/backup` — Download instant SQLite (`reports.db`) snapshot\n"
-        "• `/cleardata MM-YYYY` — Purge images and database logs for month\n"
+        "• `/cleardata MM-YYYY` — Purge Drive images and database logs for month\n"
     )
 
     await update.message.reply_text(menu_text, parse_mode="Markdown")
@@ -369,18 +537,64 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
 
     cleaned_text = raw_caption.strip()
 
+    if is_photo:
+        tg_media = update.message.photo[-1]
+    else:
+        tg_media = update.message.document
+
+    # 1. Download file locally to check EXIF / OCR and compress
+    file = await context.bot.get_file(tg_media.file_id)
+    file_name = f"{tg_media.file_unique_id}.jpg"
+    file_path = os.path.join(DOWNLOAD_DIR, file_name)
+    await file.download_to_drive(file_path)
+
+    # 2. Extract original capture date from EXIF before compression
+    exif_timestamp = extract_image_capture_date(file_path)
+
+    # 3. Determine date priority: Manual caption > Camera EXIF > OCR Watermark > Upload time
     date_match = re.match(r"^(\d{4}-\d{2}-\d{2})\s*(.*)", cleaned_text)
     if date_match:
         test_date = date_match.group(1)
         remaining_caption = date_match.group(2).strip()
         timestamp = f"{test_date} 12:00:00"
+        date_source_label = "manual date"
     else:
         remaining_caption = cleaned_text
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if exif_timestamp:
+            timestamp = exif_timestamp
+            date_source_label = "photo capture date (EXIF)"
+        else:
+            # Run OCR in background executor so it doesn't block the async event loop
+            loop = asyncio.get_running_loop()
+            ocr_timestamp = await loop.run_in_executor(None, extract_visual_timestamp_ocr, file_path)
 
+            if ocr_timestamp:
+                timestamp = ocr_timestamp
+                date_source_label = "camera watermark (OCR)"
+            else:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                date_source_label = "upload time"
+
+    # 4. Compress image
+    compress_image(file_path)
+
+    # 5. Upload to Google Drive; ONLY delete local file if Drive upload genuinely succeeded
+    drive_file_id = upload_image_to_drive(file_path, file_name)
+
+    if drive_file_id:
+        stored_image_reference = drive_file_id
+        if os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+    else:
+        # Keep local copy permanently if Drive upload is inactive/failing
+        stored_image_reference = file_path
+
+    # Parse task details
     is_before = bool(re.search(r"#before\b", remaining_caption, re.IGNORECASE))
     is_after = bool(re.search(r"#after\b", remaining_caption, re.IGNORECASE))
-
     remaining_caption = re.sub(r"#(before|after)\b", "", remaining_caption, flags=re.IGNORECASE).strip()
 
     block_match = re.search(r"#block[\s\-_]*([a-zA-Z0-9]+)", remaining_caption, re.IGNORECASE)
@@ -396,17 +610,6 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
 
     caption = final_caption or "Task completed"
     full_description = f"[{user_name}] {caption}"
-
-    if is_photo:
-        tg_media = update.message.photo[-1]
-    else:
-        tg_media = update.message.document
-
-    file = await context.bot.get_file(tg_media.file_id)
-    file_name = f"{tg_media.file_unique_id}.jpg"
-    file_path = os.path.join(DOWNLOAD_DIR, file_name)
-    await file.download_to_drive(file_path)
-    compress_image(file_path)
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -427,13 +630,14 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
                 UPDATE task_reports 
                 SET pair_image_path = ?, pair_status = 'COMPLETED', description = ?
                 WHERE id = ?
-            ''', (file_path, full_description, task_id))
+            ''', (stored_image_reference, full_description, task_id))
             conn.commit()
             conn.close()
 
             await update.message.reply_text(
                 f"🟢 **Paired Successfully!**\n"
                 f"Linked AFTER photo to Task #{task_id} [{block_name}].\n"
+                f"• Assigned Date: `{date_label}` ({date_source_label})\n"
                 f"Task status is now **COMPLETED**.",
                 parse_mode="Markdown",
                 reply_to_message_id=update.message.message_id
@@ -443,14 +647,15 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
             cursor.execute('''
                 INSERT INTO task_reports (user_id, image_path, description, date_logged, block_name, task_type, pair_image_path, pair_status)
                 VALUES (?, ?, ?, ?, ?, 'SINGLE', NULL, 'COMPLETED')
-            ''', (user_id, file_path, full_description + " (Unmatched #after)", timestamp, block_name))
+            ''', (user_id, stored_image_reference, full_description + " (Unmatched #after)", timestamp, block_name))
             task_id = cursor.lastrowid
             conn.commit()
             conn.close()
 
             await update.message.reply_text(
                 f"⚠️ Logged as Single Task #{task_id} [{block_name}].\n"
-                f"No open `#before` task was found to link this `#after` photo.",
+                f"No open `#before` task was found to link this `#after` photo.\n"
+                f"• Assigned Date: `{date_label}` ({date_source_label})",
                 reply_to_message_id=update.message.message_id
             )
             return
@@ -460,13 +665,14 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
         cursor.execute('''
             INSERT INTO task_reports (user_id, image_path, description, date_logged, block_name, task_type, pair_image_path, pair_status)
             VALUES (?, ?, ?, ?, ?, 'PAIR', NULL, 'PENDING')
-        ''', (user_id, file_path, full_description, timestamp, block_name))
+        ''', (user_id, stored_image_reference, full_description, timestamp, block_name))
         task_id = cursor.lastrowid
         conn.commit()
         conn.close()
 
         await update.message.reply_text(
             f"🔴 **Before Photo Logged!** (Task #{task_id} [{block_name}])\n"
+            f"• Assigned Date: `{date_label}` ({date_source_label})\n"
             f"Waiting for clean photo. Send next photo with `#after #{block_name.lower().replace(' ', '')}` to complete.",
             reply_to_message_id=update.message.message_id
         )
@@ -476,14 +682,15 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
     cursor.execute('''
         INSERT INTO task_reports (user_id, image_path, description, date_logged, block_name, task_type, pair_image_path, pair_status)
         VALUES (?, ?, ?, ?, ?, 'SINGLE', NULL, 'COMPLETED')
-    ''', (user_id, file_path, full_description, timestamp, block_name))
+    ''', (user_id, stored_image_reference, full_description, timestamp, block_name))
     task_id = cursor.lastrowid
     conn.commit()
     conn.close()
 
     if has_block:
         await update.message.reply_text(
-            f"✅ Task logged by {user_name} [{block_name}] (ID: #{task_id}) for date: {date_label}\n"
+            f"✅ Task logged by {user_name} [{block_name}] (ID: #{task_id})\n"
+            f"• Date: `{date_label}` ({date_source_label})\n"
             f"Tip: Made a mistake? Type /undo to cancel this submission.",
             reply_to_message_id=update.message.message_id
         )
@@ -500,7 +707,8 @@ async def handle_photo_or_document(update: Update, context: ContextTypes.DEFAULT
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await update.message.reply_text(
-            f"⚠️ Task logged by {user_name} (ID: #{task_id}) for date: {date_label}\n"
+            f"⚠️ Task logged by {user_name} (ID: #{task_id})\n"
+            f"• Date: `{date_label}` ({date_source_label})\n"
             f"No `#block` tag detected. Please select the correct block:",
             reply_markup=reply_markup,
             reply_to_message_id=update.message.message_id
@@ -628,19 +836,16 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ No task found to undo.")
         return
 
-    task_id, task_author_id, img_path, desc, block, pair_img = task
+    task_id, task_author_id, img_ref, desc, block, pair_img_ref = task
 
-    if img_path and os.path.exists(img_path):
-        try:
-            os.remove(img_path)
-        except Exception as e:
-            print(f"Failed to delete {img_path}: {e}")
-
-    if pair_img and os.path.exists(pair_img):
-        try:
-            os.remove(pair_img)
-        except Exception as e:
-            print(f"Failed to delete {pair_img}: {e}")
+    for ref in [img_ref, pair_img_ref]:
+        if ref:
+            delete_drive_file(ref)
+            if os.path.exists(ref):
+                try:
+                    os.remove(ref)
+                except Exception:
+                    pass
 
     cursor.execute("DELETE FROM task_reports WHERE id = ?", (task_id,))
     conn.commit()
@@ -651,7 +856,7 @@ async def undo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• **Task ID:** #{task_id}\n"
         f"• **Location:** {block}\n"
         f"• **Details:** {desc}\n"
-        f"• **Images:** Purged from disk.",
+        f"• **Images:** Purged from storage.",
         parse_mode="Markdown"
     )
 
@@ -765,22 +970,45 @@ async def my_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def parse_month_and_block_args(args):
+    month_lookup = {
+        'jan': '01', 'january': '01',
+        'feb': '02', 'february': '02',
+        'mar': '03', 'march': '03',
+        'apr': '04', 'april': '04',
+        'may': '05',
+        'jun': '06', 'june': '06',
+        'jul': '07', 'july': '07',
+        'aug': '08', 'august': '08',
+        'sep': '09', 'september': '09',
+        'oct': '10', 'october': '10',
+        'nov': '11', 'november': '11',
+        'dec': '12', 'december': '12',
+    }
+
     target_ym = datetime.now().strftime("%Y-%m")
     target_block = None
 
-    for arg in args:
-        val = arg.strip()
+    joined_args = " ".join(args).strip().lower()
+
+    # Detect written month name + year (e.g., 'october 2026' or 'oct 2026')
+    written_match = re.search(r'\b([a-z]{3,9})\s+(20\d{2})\b', joined_args)
+    if written_match:
+        m_str, y_str = written_match.groups()
+        if m_str in month_lookup:
+            target_ym = f"{y_str}-{month_lookup[m_str]}"
+            joined_args = re.sub(r'\b[a-z]{3,9}\s+20\d{2}\b', '', joined_args).strip()
+
+    # Detect remaining standalone block arguments
+    for val in joined_args.split():
         if re.match(r"^\d{2}-\d{4}$", val):
             parts = val.split("-")
             target_ym = f"{parts[1]}-{parts[0]}"
         elif re.match(r"^\d{4}-\d{2}$", val):
             target_ym = val
-        else:
-            m = re.search(r"(?:#?block[\s\-_]*)?([a-zA-Z0-9]+)", val, re.IGNORECASE)
+        elif val:
+            m = re.search(r"(?:#?block[\s\-_]*)?([a-zA-Z0-9]+)", val)
             if m:
                 target_block = f"BLOCK {m.group(1).upper()}"
-            else:
-                target_block = val.upper()
 
     return target_ym, target_block
 
@@ -792,7 +1020,11 @@ async def report_monthly_command(update: Update, context: ContextTypes.DEFAULT_T
 
     block_suffix = f"_{target_block.replace(' ', '_')}" if target_block else ""
     output_docx = os.path.join(DATA_DIR, f"Monthly_Report_{target_ym}{block_suffix}.docx")
-    generated_path = generate_monthly_docx(output_docx, target_ym, target_block)
+
+    loop = asyncio.get_running_loop()
+    generated_path = await loop.run_in_executor(
+        None, generate_monthly_docx, output_docx, target_ym, target_block
+    )
 
     if not generated_path or not os.path.exists(generated_path):
         await status_msg.edit_text(f"No records found in database for {filter_desc}.")
@@ -859,15 +1091,17 @@ async def clear_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"No records found for month `{target_ym}` to delete.")
         return
 
-    deleted_files_count = 0
+    deleted_drive_count = 0
     for img1, img2 in rows:
-        for p in [img1, img2]:
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                    deleted_files_count += 1
-                except Exception as e:
-                    print(f"Failed to delete {p}: {e}")
+        for ref in [img1, img2]:
+            if ref:
+                if delete_drive_file(ref):
+                    deleted_drive_count += 1
+                if os.path.exists(ref):
+                    try:
+                        os.remove(ref)
+                    except Exception:
+                        pass
 
     cursor.execute('DELETE FROM task_reports WHERE date_logged LIKE ?', (f"{target_ym}%",))
     conn.commit()
@@ -876,7 +1110,7 @@ async def clear_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"🧹 Cleaned data for `{target_ym}`:\n"
         f"• Database records removed: {len(rows)}\n"
-        f"• Image files deleted: {deleted_files_count}"
+        f"• Images deleted: {deleted_drive_count}"
     )
 
 
@@ -942,6 +1176,14 @@ async def post_init(application):
 
 if __name__ == '__main__':
     init_db()
+    
+    # Configure generous network timeouts for media downloads & uploads
+    request_config = HTTPXRequest(
+        connect_timeout=20.0,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        pool_timeout=10.0,
+    )
 
     app = ApplicationBuilder().token(TOKEN).post_init(post_init).build()
 
