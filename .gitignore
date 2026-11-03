@@ -1,10 +1,22 @@
+# Sensitive credentials & tokens
+credentials.json
+token_gdrive.json
+service_account.json
 token.txt
-reports.db
-reports_backup_*.db
+
+# Database & local media
+*.db
 images/
+
+# Generated exports
 *.docx
-*.pdf
 *.csv
+
+# Python cache & virtual environments
 __pycache__/
-.vscode/
-data/
+*.pyc
+venv/
+
+*.pdf
+config.bat
+node_modules
